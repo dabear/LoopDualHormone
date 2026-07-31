@@ -595,7 +595,7 @@ final class GlucoseAlertManager: ObservableObject {
                 return
             }
             let alert = decideAndUpdate(
-                state: &lowState, identifier: Self.lowAlertIdentifier, interruptionLevel: .timeSensitive,
+                state: &lowState, identifier: Self.lowAlertIdentifier, interruptionLevel: .critical,
                 title: "Low Glucose",
                 body: "Glucose is below \(Int(threshold)) mg/dL (current: \(Int(mgdl)))",
                 delay: nil,
@@ -633,7 +633,7 @@ final class GlucoseAlertManager: ObservableObject {
         let threshold = config.highThresholdMgDL
         if mgdl > threshold {
             let alert = decideAndUpdate(
-                state: &highState, identifier: Self.highAlertIdentifier, interruptionLevel: .timeSensitive,
+                state: &highState, identifier: Self.highAlertIdentifier, interruptionLevel: .critical,
                 title: "High Glucose",
                 body: "Glucose is above \(Int(threshold)) mg/dL (current: \(Int(mgdl)))",
                 delay: config.highDelayEnabled ? config.highDelay : nil,
