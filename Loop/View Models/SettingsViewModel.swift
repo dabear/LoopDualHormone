@@ -77,6 +77,7 @@ class SettingsViewModel {
     
     var availableSupports: [SupportUI]
     let pumpManagerSettingsViewModel: PumpManagerViewModel
+    let glucagonPumpManagerSettingsViewModel: PumpManagerViewModel
     let cgmManagerSettingsViewModel: CGMManagerViewModel
     let servicesViewModel: ServicesViewModel
     let criticalEventLogExportViewModel: CriticalEventLogExportViewModel
@@ -147,6 +148,7 @@ class SettingsViewModel {
                 alertMuter: AlertMuter,
                 versionUpdateViewModel: VersionUpdateViewModel,
                 pumpManagerSettingsViewModel: PumpManagerViewModel,
+                glucagonPumpManagerSettingsViewModel: PumpManagerViewModel,
                 cgmManagerSettingsViewModel: CGMManagerViewModel,
                 servicesViewModel: ServicesViewModel,
                 criticalEventLogExportViewModel: CriticalEventLogExportViewModel,
@@ -167,6 +169,7 @@ class SettingsViewModel {
         self.alertMuter = alertMuter
         self.versionUpdateViewModel = versionUpdateViewModel
         self.pumpManagerSettingsViewModel = pumpManagerSettingsViewModel
+        self.glucagonPumpManagerSettingsViewModel = glucagonPumpManagerSettingsViewModel
         self.cgmManagerSettingsViewModel = cgmManagerSettingsViewModel
         self.servicesViewModel = servicesViewModel
         self.criticalEventLogExportViewModel = criticalEventLogExportViewModel
@@ -249,6 +252,7 @@ extension SettingsViewModel {
                                  alertMuter: AlertMuter(),
                                  versionUpdateViewModel: VersionUpdateViewModel(supportManager: nil, guidanceColors: .default),
                                  pumpManagerSettingsViewModel: DeviceViewModel<PumpManagerDescriptor>(),
+                                 glucagonPumpManagerSettingsViewModel: DeviceViewModel<PumpManagerDescriptor>(),
                                  cgmManagerSettingsViewModel: DeviceViewModel<CGMManagerDescriptor>(),
                                  servicesViewModel: ServicesViewModel.preview,
                                  criticalEventLogExportViewModel: CriticalEventLogExportViewModel(exporterFactory: MockCriticalEventLogExporterFactory()),

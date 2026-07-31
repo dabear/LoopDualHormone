@@ -548,6 +548,12 @@ class LoopAppManager: NSObject {
             availableDevices: deviceDataManager.availablePumpManagers,
             deleteTestingDataFunc: deletePumpDataFunc
         )
+        let glucagonPumpViewModel = PumpManagerViewModel(
+            image: { [weak self] in (self?.deviceDataManager.glucagonPumpManager as? PumpManagerUI)?.smallImage },
+            name: { [weak self] in self?.deviceDataManager.glucagonPumpManager?.localizedTitle ?? "" },
+            isSetUp: { [weak self] in self?.deviceDataManager.glucagonPumpManager?.isOnboarded == true },
+            availableDevices: deviceDataManager.availablePumpManagers
+        )
 
         let cgmViewModel = CGMManagerViewModel(
             image: {[weak self] in (self?.deviceDataManager.cgmManager as? DeviceManagerUI)?.smallImage },
@@ -565,6 +571,7 @@ class LoopAppManager: NSObject {
                                           alertMuter: alertManager.alertMuter,
                                           versionUpdateViewModel: versionUpdateViewModel,
                                           pumpManagerSettingsViewModel: pumpViewModel,
+                                          glucagonPumpManagerSettingsViewModel: glucagonPumpViewModel,
                                           cgmManagerSettingsViewModel: cgmViewModel,
                                           servicesViewModel: servicesViewModel,
                                           criticalEventLogExportViewModel: CriticalEventLogExportViewModel(exporterFactory: criticalEventLogExportManager),
@@ -1182,4 +1189,3 @@ extension LoopAppManager: SimulatedData {
         }
     }
 }
-

@@ -85,6 +85,12 @@ final class StatusTableViewController: LoopChartsTableViewController {
         statusTableViewModel.settingsViewModel.pumpManagerSettingsViewModel.didTapAdd = { [weak self] in
             self?.addPumpManager(withIdentifier: $0.identifier)
         }
+        statusTableViewModel.settingsViewModel.glucagonPumpManagerSettingsViewModel.didTap = { [weak self] in
+            self?.onGlucagonPumpTapped()
+        }
+        statusTableViewModel.settingsViewModel.glucagonPumpManagerSettingsViewModel.didTapAdd = { [weak self] in
+            self?.addGlucagonPumpManager(withIdentifier: $0.identifier)
+        }
         statusTableViewModel.settingsViewModel.cgmManagerSettingsViewModel.didTap = { [weak self] in
             self?.onCGMTapped()
         }
@@ -1596,6 +1602,19 @@ final class StatusTableViewController: LoopChartsTableViewController {
         show(settingsViewController, sender: self)
     }
 
+    private func onGlucagonPumpTapped() {
+        guard let pumpManager = deviceManager.glucagonPumpManager as? PumpManagerUI else { return }
+        var settingsViewController = pumpManager.settingsViewController(
+            bluetoothProvider: deviceManager.bluetoothProvider,
+            colorPalette: .default,
+            allowDebugFeatures: FeatureFlags.allowDebugFeatures,
+            allowedInsulinTypes: deviceManager.allowedInsulinTypes
+        )
+        settingsViewController.pumpManagerOnboardingDelegate = deviceManager.glucagonPumpOnboardingDelegate
+        settingsViewController.completionDelegate = self
+        show(settingsViewController, sender: self)
+    }
+
     private func onCGMTapped() {
         guard let cgmManager = deviceManager.cgmManager as? CGMManagerUI else {
             // assert?
@@ -2094,6 +2113,29 @@ extension StatusTableViewController {
                 show(setupViewController, sender: self)
             case .createdAndOnboarded:
                 log.default("CGM manager with identifier '%{public}@' created and onboarded", identifier)
+            }
+        }
+    }
+}
+
+extension StatusTableViewController {
+    fileprivate func addGlucagonPumpManager(withIdentifier identifier: String) {
+        guard let maximumBolus = settingsManager.settings.maximumBolus else {
+            log.error("Failure to setup glucagon pump manager: maximum bolus is not configured")
+            return
+        }
+
+        switch deviceManager.setupGlucagonPumpManagerUI(withIdentifier: identifier, maxBolusUnits: maximumBolus) {
+        case .failure(let error):
+            log.error("Failure to setup glucagon pump manager with identifier '%{public}@': %{public}@", identifier, String(describing: error))
+        case .success(let success):
+            switch success {
+            case .userInteractionRequired(var setupViewController):
+                setupViewController.pumpManagerOnboardingDelegate = deviceManager.glucagonPumpOnboardingDelegate
+                setupViewController.completionDelegate = self
+                show(setupViewController, sender: self)
+            case .createdAndOnboarded:
+                log.default("Glucagon pump manager with identifier '%{public}@' created and onboarded", identifier)
             }
         }
     }
