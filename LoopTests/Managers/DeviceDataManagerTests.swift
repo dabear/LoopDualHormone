@@ -106,6 +106,7 @@ final class DeviceDataManagerTests: XCTestCase {
 
         deviceDataManager.pumpManager = pumpManager
         deviceDataManager.cgmManager = cgmManager
+        deviceDataManager.resetGlucagonHistoryForTesting()
     }
 
     func testValidateMaxTempBasalDoesntCancelTempBasalIfHigher() async throws {
@@ -182,6 +183,54 @@ final class DeviceDataManagerTests: XCTestCase {
         let alertStore = AlertStore()
         deviceDataManager.alertStoreHasUpdatedAlertData(alertStore)
         XCTAssertEqual(uploadEventListener.lastUploadTriggeringType, .alert)
+    }
+
+    func testSecondaryPumpSupportsSecondInstanceOfSamePlugin() {
+        let glucagonPump = MockPumpManager()
+        glucagonPump.rawState = ["role": "glucagon"]
+
+        deviceDataManager.glucagonPumpManager = glucagonPump
+
+        XCTAssertTrue(deviceDataManager.pumpManager === pumpManager)
+        XCTAssertTrue(deviceDataManager.glucagonPumpManager === glucagonPump)
+        XCTAssertNil((deviceDataManager.rawPumpManager?["state"] as? [String: Any])?["role"])
+        XCTAssertEqual((deviceDataManager.rawGlucagonPumpManager?["state"] as? [String: Any])?["role"] as? String, "glucagon")
+        XCTAssertTrue(glucagonPump.pumpManagerDelegate is GlucagonPumpDelegate)
+        XCTAssertFalse(glucagonPump.pumpManagerDelegate === pumpManager.pumpManagerDelegate)
+    }
+
+    func testManualGlucagonBolusUsesOnlySecondaryPump() async throws {
+        let glucagonPump = MockPumpManager()
+        deviceDataManager.glucagonPumpManager = glucagonPump
+        var insulinCommands = 0
+        var glucagonCommand: (Double, BolusActivationType)?
+        pumpManager.enactBolusCalled = { _, _ in insulinCommands += 1 }
+        glucagonPump.enactBolusCalled = { glucagonCommand = ($0, $1) }
+
+        try await deviceDataManager.enactManualGlucagonBolus(units: 2)
+
+        XCTAssertEqual(insulinCommands, 0)
+        XCTAssertEqual(glucagonCommand?.0, 2)
+        XCTAssertEqual(glucagonCommand?.1, .manualNoRecommendation)
+        XCTAssertEqual(deviceDataManager.glucagonDeliveryHistory.map(\.units), [2])
+        XCTAssertNil(loopControlMock.lastCancelActiveTempBasalReason)
+    }
+
+    func testSecondaryPumpEventsRemainOutsideInsulinStore() {
+        let glucagonPump = MockPumpManager()
+        deviceDataManager.glucagonPumpManager = glucagonPump
+        let date = Date()
+        let event = NewPumpEvent(date: date, dose: nil, raw: Data([1, 2, 3]), title: "Glucagon event")
+        let stored = expectation(description: "Secondary event stored")
+
+        glucagonPump.pumpManagerDelegate?.pumpManager(glucagonPump, hasNewPumpEvents: [event], lastReconciliation: date, replacePendingEvents: false) { error in
+            XCTAssertNil(error)
+            stored.fulfill()
+        }
+        wait(for: [stored], timeout: 1)
+
+        XCTAssertEqual(deviceDataManager.startDateToFilterNewPumpEvents(for: glucagonPump), date)
+        XCTAssertNotEqual(deviceDataManager.startDateToFilterNewPumpEvents(for: pumpManager), date)
     }
 
 }
