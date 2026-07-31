@@ -44,6 +44,7 @@ struct SettingsView: View {
             
             case cgmPicker
             case pumpPicker
+            case glucagonPumpPicker
             case servicePicker
         }
         
@@ -54,6 +55,7 @@ struct SettingsView: View {
             
             case favoriteFoods
             case presets
+            case glucagonBolus
         }
     }
     
@@ -130,6 +132,12 @@ struct SettingsView: View {
                         title: Text("Add Pump", comment: "The title of the pump chooser in settings"),
                         buttons: pumpChoices
                     )
+                case .glucagonPumpPicker:
+                    return ActionSheet(
+                        title: Text("Add Manual Glucagon Pump", comment: "Title of glucagon pump chooser"),
+                        message: Text("This pump is isolated from Loop automation and can only receive confirmed manual boluses.", comment: "Glucagon pump chooser safety message"),
+                        buttons: glucagonPumpChoices
+                    )
                 case .servicePicker:
                     return ActionSheet(
                         title: Text("Add Service", comment: "The title of the add service action sheet in settings"),
@@ -166,6 +174,10 @@ struct SettingsView: View {
                         }
                     case .favoriteFoods:
                         FavoriteFoodsView(insightsDelegate: viewModel.favoriteFoodInsightsDelegate)
+                    case .glucagonBolus:
+                        if let deviceManager = viewModel.deviceManager {
+                            GlucagonBolusView(deviceManager: deviceManager)
+                        }
                     }
                 }
                 .environmentObject(displayGlucosePreference)
@@ -194,6 +206,97 @@ struct SettingsView: View {
             get: { self.viewModel.closedLoopPreference },
             set: { self.viewModel.closedLoopPreference = $0 }
         )
+    }
+}
+
+private struct GlucagonBolusAlert: Identifiable {
+    enum Kind { case confirmation(Double), error(String), success(Double) }
+    let id = UUID()
+    let kind: Kind
+}
+
+private struct GlucagonBolusView: View {
+    let deviceManager: DeviceDataManager
+
+    @Environment(\.dismissAction) private var dismiss
+    @State private var amount = ""
+    @State private var alert: GlucagonBolusAlert?
+    @State private var isDelivering = false
+    @State private var history: [GlucagonDeliveryRecord] = []
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section {
+                    Text("This pump is not used by Loop automation. Amounts are pump units configured for glucagon, not insulin units.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                Section(header: Text("Manual Bolus")) {
+                    TextField("Pump units", text: $amount)
+                        .keyboardType(.decimalPad)
+                    Button(isDelivering ? "Delivering…" : "Review and Deliver") {
+                        guard let units = Double(amount.replacingOccurrences(of: ",", with: ".")), units > 0 else {
+                            alert = GlucagonBolusAlert(kind: .error(GlucagonPumpError.invalidAmount.localizedDescription))
+                            return
+                        }
+                        alert = GlucagonBolusAlert(kind: .confirmation(units))
+                    }
+                    .disabled(isDelivering)
+                }
+
+                if !history.isEmpty {
+                    Section(header: Text("Recent Manual Deliveries")) {
+                        ForEach(history.suffix(10).reversed()) { record in
+                            HStack {
+                                Text(record.date, style: .date)
+                                Text(record.date, style: .time)
+                                Spacer()
+                                Text(formatted(record.units))
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Glucagon Pump")
+            .navigationBarItems(trailing: Button("Done") { dismiss() })
+            .onAppear { history = deviceManager.glucagonDeliveryHistory }
+            .alert(item: $alert) { item in
+                switch item.kind {
+                case .confirmation(let units):
+                    return Alert(
+                        title: Text("Confirm Manual Glucagon Bolus"),
+                        message: Text("Deliver \(formatted(units)) now? This command is independent of Loop's insulin dosing."),
+                        primaryButton: .cancel(),
+                        secondaryButton: .destructive(Text("Deliver")) { deliver(units) }
+                    )
+                case .error(let message):
+                    return Alert(title: Text("Glucagon Not Delivered"), message: Text(message), dismissButton: .default(Text("OK")))
+                case .success(let units):
+                    return Alert(title: Text("Glucagon Command Sent"), message: Text("Requested \(formatted(units))."), dismissButton: .default(Text("OK")))
+                }
+            }
+        }
+    }
+
+    private func formatted(_ units: Double) -> String {
+        String(format: "%.2f pump units", units)
+    }
+
+    private func deliver(_ units: Double) {
+        isDelivering = true
+        Task { @MainActor in
+            do {
+                try await deviceManager.enactManualGlucagonBolus(units: units)
+                history = deviceManager.glucagonDeliveryHistory
+                amount = ""
+                alert = GlucagonBolusAlert(kind: .success(units))
+            } catch {
+                alert = GlucagonBolusAlert(kind: .error(error.localizedDescription))
+            }
+            isDelivering = false
+        }
     }
 }
 
@@ -457,6 +560,9 @@ extension SettingsView {
         Section(header: SectionHeader(label: NSLocalizedString("Devices", comment: ""))) {
             pumpSection
                 .accessibilityIdentifier("settingsViewInsulinPump")
+
+            glucagonPumpSection
+                .accessibilityIdentifier("settingsViewGlucagonPump")
             
             cgmSection
                 .accessibilityIdentifier("settingsViewCGM")
@@ -484,6 +590,44 @@ extension SettingsView {
         var result = viewModel.pumpManagerSettingsViewModel.availableDevices.map { availableDevice in
             ActionSheet.Button.default(Text(availableDevice.localizedTitle)) {
                 self.viewModel.pumpManagerSettingsViewModel.didTapAdd(availableDevice)
+            }
+        }
+        result.append(.cancel())
+        return result
+    }
+
+    @ViewBuilder
+    private var glucagonPumpSection: some View {
+        if viewModel.glucagonPumpManagerSettingsViewModel.isSetUp() {
+            LargeButton(
+                action: { sheet = .glucagonBolus },
+                includeArrow: true,
+                imageView: deviceImage(uiImage: viewModel.glucagonPumpManagerSettingsViewModel.image()),
+                label: NSLocalizedString("Manual Glucagon Bolus", comment: "Glucagon bolus button"),
+                descriptiveText: viewModel.glucagonPumpManagerSettingsViewModel.name()
+            )
+            LargeButton(
+                action: viewModel.glucagonPumpManagerSettingsViewModel.didTap,
+                includeArrow: true,
+                imageView: Image(systemName: "gearshape"),
+                label: NSLocalizedString("Glucagon Pump Settings", comment: "Glucagon pump settings button"),
+                descriptiveText: NSLocalizedString("Manual delivery only", comment: "Glucagon pump safety description")
+            )
+        } else if viewModel.isOnboardingComplete {
+            LargeButton(
+                action: { actionSheet = .glucagonPumpPicker },
+                includeArrow: false,
+                imageView: plusImage,
+                label: NSLocalizedString("Add Glucagon Pump", comment: "Add glucagon pump button"),
+                descriptiveText: NSLocalizedString("Optional, manual boluses only", comment: "Add glucagon pump description")
+            )
+        }
+    }
+
+    private var glucagonPumpChoices: [ActionSheet.Button] {
+        var result = viewModel.glucagonPumpManagerSettingsViewModel.availableDevices.map { device in
+            ActionSheet.Button.default(Text(device.localizedTitle)) {
+                viewModel.glucagonPumpManagerSettingsViewModel.didTapAdd(device)
             }
         }
         result.append(.cancel())
