@@ -40,6 +40,151 @@ protocol UploadEventListener {
     func triggerUpload(for triggeringType: RemoteDataType)
 }
 
+struct GlucagonDeliveryRecord: Equatable, Identifiable {
+    let id: UUID
+    let date: Date
+    let units: Double
+
+    init(id: UUID = UUID(), date: Date = Date(), units: Double) {
+        self.id = id
+        self.date = date
+        self.units = units
+    }
+
+    init?(rawValue: [String: Any]) {
+        guard let id = rawValue["id"] as? String,
+              let uuid = UUID(uuidString: id),
+              let date = rawValue["date"] as? Date,
+              let units = rawValue["units"] as? Double
+        else { return nil }
+        self.init(id: uuid, date: date, units: units)
+    }
+
+    var rawValue: [String: Any] {
+        ["id": id.uuidString, "date": date, "units": units]
+    }
+}
+
+private struct GlucagonReservoirValue: ReservoirValue {
+    let startDate: Date
+    let unitVolume: Double
+}
+
+enum GlucagonPumpError: LocalizedError, Equatable {
+    case noPumpConfigured
+    case pumpNotReady
+    case invalidAmount
+    case bolusInProgress
+    case automaticDeliveryForbidden
+    case basalDeliveryForbidden
+
+    var errorDescription: String? {
+        switch self {
+        case .noPumpConfigured: return NSLocalizedString("No glucagon pump is configured.", comment: "Glucagon pump error")
+        case .pumpNotReady: return NSLocalizedString("The glucagon pump is not ready for delivery.", comment: "Glucagon pump error")
+        case .invalidAmount: return NSLocalizedString("Enter a glucagon amount greater than zero.", comment: "Glucagon pump error")
+        case .bolusInProgress: return NSLocalizedString("A glucagon bolus is already in progress.", comment: "Glucagon pump error")
+        case .automaticDeliveryForbidden: return NSLocalizedString("Automatic glucagon delivery is disabled.", comment: "Glucagon pump error")
+        case .basalDeliveryForbidden: return NSLocalizedString("Basal glucagon delivery is disabled.", comment: "Glucagon pump error")
+        }
+    }
+}
+
+/// FIFO gate shared by all app-initiated pump commands. It prevents two
+/// instances of the same plugin from competing for Bluetooth/radio resources.
+@MainActor
+final class PumpCommandArbitrator {
+    private var commandInProgress = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func perform<T>(_ operation: () async throws -> T) async rethrows -> T {
+        await acquire()
+        defer { release() }
+        return try await operation()
+    }
+
+    private func acquire() async {
+        if !commandInProgress {
+            commandInProgress = true
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    private func release() {
+        if waiters.isEmpty {
+            commandInProgress = false
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+}
+
+@MainActor
+final class GlucagonPumpOnboardingDelegate: PumpManagerOnboardingDelegate {
+    weak var deviceDataManager: DeviceDataManager?
+
+    init(deviceDataManager: DeviceDataManager? = nil) {
+        self.deviceDataManager = deviceDataManager
+    }
+
+    func pumpManagerOnboarding(didCreatePumpManager pumpManager: PumpManagerUI) {
+        deviceDataManager?.glucagonPumpManager = pumpManager
+    }
+
+    func pumpManagerOnboarding(didOnboardPumpManager pumpManager: PumpManagerUI) {
+        precondition(pumpManager.isOnboarded)
+        deviceDataManager?.glucagonPumpManager = pumpManager
+    }
+
+    func pumpManagerOnboarding(didPauseOnboarding pumpManager: PumpManagerUI) { }
+}
+
+/// Gives the secondary instance a distinct alert/resource identity while
+/// forwarding lifecycle and pump data into DeviceDataManager's isolated
+/// glucagon branches.
+@MainActor
+final class GlucagonPumpDelegate: @preconcurrency PumpManagerDelegate {
+    weak var deviceDataManager: DeviceDataManager?
+
+    init(deviceDataManager: DeviceDataManager? = nil) { self.deviceDataManager = deviceDataManager }
+
+    static func namespacedManagerIdentifier(_ identifier: String) -> String { "GlucagonPump.\(identifier)" }
+    private func namespaced(_ identifier: Alert.Identifier) -> Alert.Identifier {
+        Alert.Identifier(managerIdentifier: Self.namespacedManagerIdentifier(identifier.managerIdentifier), alertIdentifier: identifier.alertIdentifier)
+    }
+    private func namespaced(_ alert: Alert) -> Alert {
+        Alert(identifier: namespaced(alert.identifier), foregroundContent: alert.foregroundContent, backgroundContent: alert.backgroundContent, trigger: alert.trigger, interruptionLevel: alert.interruptionLevel, sound: alert.sound, metadata: alert.metadata, categoryIdentifier: alert.categoryIdentifier)
+    }
+
+    func issueAlert(_ alert: Alert) async { await deviceDataManager?.issueAlert(namespaced(alert)) }
+    func retractAlert(identifier: Alert.Identifier) async { await deviceDataManager?.retractAlert(identifier: namespaced(identifier)) }
+    func doesIssuedAlertExist(identifier: Alert.Identifier) async throws -> Bool { try await deviceDataManager?.doesIssuedAlertExist(identifier: namespaced(identifier)) ?? false }
+    func lookupAllUnretracted(managerIdentifier: String) async throws -> [PersistedAlert] { try await deviceDataManager?.lookupAllUnretracted(managerIdentifier: Self.namespacedManagerIdentifier(managerIdentifier)) ?? [] }
+    func lookupAllUnacknowledgedUnretracted(managerIdentifier: String) async throws -> [PersistedAlert] { try await deviceDataManager?.lookupAllUnacknowledgedUnretracted(managerIdentifier: Self.namespacedManagerIdentifier(managerIdentifier)) ?? [] }
+    func recordRetractedAlert(_ alert: Alert, at date: Date) async throws { try await deviceDataManager?.recordRetractedAlert(namespaced(alert), at: date) }
+
+    nonisolated func deviceManager(_ manager: DeviceManager, logEventForDeviceIdentifier deviceIdentifier: String?, type: DeviceLogEntryType, message: String, completion: ((Error?) -> Void)?) {
+        Task { @MainActor in self.deviceDataManager?.deviceManager(manager, logEventForDeviceIdentifier: "glucagon:\(deviceIdentifier ?? "unknown")", type: type, message: message, completion: completion) }
+    }
+    func pumpManagerBLEHeartbeatDidFire(_ pumpManager: PumpManager) { deviceDataManager?.pumpManagerBLEHeartbeatDidFire(pumpManager) }
+    func pumpManagerMustProvideBLEHeartbeat(_ pumpManager: PumpManager) -> Bool { false }
+    func pumpManagerWillDeactivate(_ pumpManager: PumpManager) { deviceDataManager?.pumpManagerWillDeactivate(pumpManager) }
+    func pumpManagerPumpWasReplaced(_ pumpManager: PumpManager) { deviceDataManager?.pumpManagerPumpWasReplaced(pumpManager) }
+    func pumpManager(_ pumpManager: PumpManager, didUpdatePumpRecordsBasalProfileStartEvents value: Bool) { deviceDataManager?.pumpManager(pumpManager, didUpdatePumpRecordsBasalProfileStartEvents: value) }
+    func pumpManager(_ pumpManager: PumpManager, didError error: PumpManagerError) { deviceDataManager?.pumpManager(pumpManager, didError: error) }
+    func pumpManager(_ pumpManager: PumpManager, hasNewPumpEvents events: [NewPumpEvent], lastReconciliation: Date?, replacePendingEvents: Bool, completion: @escaping (Error?) -> Void) { deviceDataManager?.pumpManager(pumpManager, hasNewPumpEvents: events, lastReconciliation: lastReconciliation, replacePendingEvents: replacePendingEvents, completion: completion) }
+    func pumpManager(_ pumpManager: PumpManager, didReadReservoirValue units: Double, at date: Date, completion: @escaping (Result<(newValue: ReservoirValue, lastValue: ReservoirValue?, areStoredValuesContinuous: Bool), Error>) -> Void) { deviceDataManager?.pumpManager(pumpManager, didReadReservoirValue: units, at: date, completion: completion) }
+    func pumpManager(_ pumpManager: PumpManager, didAdjustPumpClockBy adjustment: TimeInterval) { deviceDataManager?.pumpManager(pumpManager, didAdjustPumpClockBy: adjustment) }
+    func pumpManagerDidUpdateState(_ pumpManager: PumpManager) { deviceDataManager?.pumpManagerDidUpdateState(pumpManager) }
+    func pumpManager(_ pumpManager: PumpManager, didRequestBasalRateScheduleChange schedule: BasalRateSchedule, completion: @escaping (Error?) -> Void) { completion(GlucagonPumpError.basalDeliveryForbidden) }
+    func startDateToFilterNewPumpEvents(for manager: PumpManager) -> Date { deviceDataManager?.startDateToFilterNewPumpEvents(for: manager) ?? .distantPast }
+    func pumpManager(_ pumpManager: PumpManager, didUpdate status: PumpManagerStatus, oldStatus: PumpManagerStatus) { deviceDataManager?.pumpManager(pumpManager, didUpdate: status, oldStatus: oldStatus) }
+    var detectedSystemTimeOffset: TimeInterval { deviceDataManager?.detectedSystemTimeOffset ?? 0 }
+    var automaticDosingEnabled: Bool { false }
+    var automatedTreatmentState: AutomatedTreatmentState? { nil }
+}
+
 @MainActor
 final class DeviceDataManager {
 
@@ -163,6 +308,44 @@ final class DeviceDataManager {
 
     @PersistedProperty(key: "PumpManagerState")
     var rawPumpManager: PumpManager.RawValue?
+
+    // MARK: - Secondary glucagon pump
+
+    var glucagonPumpManager: PumpManager? {
+        didSet {
+            setupGlucagonPump()
+            rawGlucagonPumpManager = glucagonPumpManager?.rawValue
+            NotificationCenter.default.post(name: .GlucagonPumpManagerChanged, object: self)
+        }
+    }
+
+    @PersistedProperty(key: "GlucagonPumpManagerState")
+    var rawGlucagonPumpManager: PumpManager.RawValue?
+
+    @PersistedProperty(key: "GlucagonDeliveryHistory")
+    private var rawGlucagonDeliveryHistory: [[String: Any]]?
+
+    @PersistedProperty(key: "GlucagonPumpEventHistory")
+    private var rawGlucagonPumpEventHistory: [[String: Any]]?
+
+    @PersistedProperty(key: "GlucagonReservoirHistory")
+    private var rawGlucagonReservoirHistory: [[String: Any]]?
+
+    private let pumpCommandArbitrator = PumpCommandArbitrator()
+    lazy var glucagonPumpOnboardingDelegate = GlucagonPumpOnboardingDelegate(deviceDataManager: self)
+    private lazy var glucagonPumpDelegate = GlucagonPumpDelegate(deviceDataManager: self)
+
+    var glucagonDeliveryHistory: [GlucagonDeliveryRecord] {
+        (rawGlucagonDeliveryHistory ?? []).compactMap(GlucagonDeliveryRecord.init(rawValue:))
+    }
+
+#if DEBUG
+    func resetGlucagonHistoryForTesting() {
+        rawGlucagonDeliveryHistory = nil
+        rawGlucagonPumpEventHistory = nil
+        rawGlucagonReservoirHistory = nil
+    }
+#endif
 
     
     var doseEnactor = DoseEnactor()
@@ -305,6 +488,7 @@ final class DeviceDataManager {
         }
 
         setupPump()
+        setupGlucagonPump()
         setupCGM()
     }
 
@@ -331,6 +515,16 @@ final class DeviceDataManager {
             }
         } else {
             pumpManager = nil
+        }
+
+        if let rawValue = rawGlucagonPumpManager {
+            if let restoredPumpManager = pumpManagerFromRawValue(rawValue) {
+                glucagonPumpManager = restoredPumpManager
+            } else {
+                log.error("Saved glucagon pump plugin unavailable; preserving persisted GlucagonPumpManagerState for a future launch")
+            }
+        } else {
+            glucagonPumpManager = nil
         }
 
         if let cgmManagerRawValue = rawCGMManager ?? UserDefaults.appGroup?.legacyCGMManagerRawValue {
@@ -392,6 +586,37 @@ final class DeviceDataManager {
 
         return .success(result)
     }
+
+    /// Creates a second instance even when it has the same plugin identifier as
+    /// the insulin pump. A zero basal schedule is deliberately mandatory.
+    func setupGlucagonPumpManagerUI(withIdentifier identifier: String, maxBolusUnits: Double, prefersToSkipUserInteraction: Bool = false) -> Swift.Result<SetupUIResult<PumpManagerViewController, PumpManagerUI>, Error> {
+        guard let pumpManagerUIType = pumpManagerTypeByIdentifier(identifier) else {
+            return .failure(UnknownPumpManagerIdentifierError())
+        }
+
+        let zeroBasalSchedule = BasalRateSchedule(
+            dailyItems: [RepeatingScheduleValue(startTime: 0, value: 0)],
+            timeZone: .current
+        )!
+        let settings = PumpManagerSetupSettings(
+            maxBasalRateUnitsPerHour: 0,
+            maxBolusUnits: maxBolusUnits,
+            basalSchedule: zeroBasalSchedule
+        )
+        let result = pumpManagerUIType.setupViewController(
+            initialSettings: settings,
+            bluetoothProvider: bluetoothProvider,
+            colorPalette: .default,
+            allowDebugFeatures: FeatureFlags.allowDebugFeatures,
+            prefersToSkipUserInteraction: prefersToSkipUserInteraction,
+            allowedInsulinTypes: allowedInsulinTypes
+        )
+        if case .createdAndOnboarded(let manager) = result {
+            glucagonPumpManager = manager
+            settingsManager.storeSettings()
+        }
+        return .success(result)
+    }
     
     public func saveUpdatedBasalRateSchedule(_ basalRateSchedule: BasalRateSchedule) {
         var therapySettings = self.settingsManager.therapySettings
@@ -445,7 +670,9 @@ final class DeviceDataManager {
             return
         }
 
-        let _ = await pumpManager.ensureCurrentPumpData()
+        let _ = await pumpCommandArbitrator.perform {
+            await pumpManager.ensureCurrentPumpData()
+        }
         await self.loopControl.loop()
     }
 
@@ -641,7 +868,9 @@ final class DeviceDataManager {
             return
         }
 
-        await pumpManager.ensureCurrentPumpData()
+        let _ = await pumpCommandArbitrator.perform {
+            await pumpManager.ensureCurrentPumpData()
+        }
     }
 
     var isGlucoseValueStale: Bool {
@@ -707,6 +936,21 @@ private extension DeviceDataManager {
         }
     }
 
+    func setupGlucagonPump() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        glucagonPumpManager?.pumpManagerDelegate = glucagonPumpDelegate
+        glucagonPumpManager?.delegateQueue = .main
+        // A secondary pump never provides Loop's heartbeat and never owns the
+        // insulin DoseStore, HUD, schedule, or delivery-uncertainty state.
+        glucagonPumpManager?.setBLEHeartbeatRequest(nil)
+        if let manager = glucagonPumpManager as? PumpManagerUI {
+            let identifier = GlucagonPumpDelegate.namespacedManagerIdentifier(manager.pluginIdentifier)
+            alertManager?.addAlertResponder(managerIdentifier: identifier, alertResponder: manager)
+            alertManager?.addAlertSoundVendor(managerIdentifier: identifier, soundVendor: manager)
+        }
+        reportPluginInitializationComplete()
+    }
+
     func setLastError(error: Error) {
         DispatchQueue.main.async {
             self.lastError = (date: Date(), error: error)
@@ -761,6 +1005,14 @@ extension DeviceDataManager {
                 allActivePlugins.append(pumpManager)
             }
         }
+
+        if let glucagonPumpManager = glucagonPumpManager {
+            // Instance identity matters here: two managers from the same plugin
+            // are valid and must both finish initialization.
+            if !allActivePlugins.contains(where: { ($0 as AnyObject) === (glucagonPumpManager as AnyObject) }) {
+                allActivePlugins.append(glucagonPumpManager)
+            }
+        }
         
         return allActivePlugins
     }
@@ -783,7 +1035,9 @@ extension DeviceDataManager {
         }
 
         do {
-            try await pumpManager.enactBolus(decisionId: decisionId, units: units, activationType: activationType)
+            try await pumpCommandArbitrator.perform {
+                try await pumpManager.enactBolus(decisionId: decisionId, units: units, activationType: activationType)
+            }
         } catch PumpManagerError.uncertainDelivery {
             // Do not generate notification on uncertain delivery error
         } catch {
@@ -795,6 +1049,33 @@ extension DeviceDataManager {
                 }
             }
         }
+    }
+
+    /// The only delivery entry point for the secondary pump. No recommendation,
+    /// temp basal, suspend/resume, or automatic activation API is exposed.
+    func enactManualGlucagonBolus(units requestedUnits: Double) async throws {
+        guard let manager = glucagonPumpManager else { throw GlucagonPumpError.noPumpConfigured }
+        guard manager.isOnboarded, !manager.isInoperable, !manager.status.deliveryIsUncertain else {
+            throw GlucagonPumpError.pumpNotReady
+        }
+        guard requestedUnits.isFinite, requestedUnits > 0 else { throw GlucagonPumpError.invalidAmount }
+
+        let units = manager.roundToSupportedBolusVolume(units: requestedUnits)
+        guard units > 0 else { throw GlucagonPumpError.invalidAmount }
+        if case .inProgress = manager.status.bolusState { throw GlucagonPumpError.bolusInProgress }
+
+        try await pumpCommandArbitrator.perform {
+            // Recheck status after waiting for another pump command to finish.
+            guard !manager.isInoperable, !manager.status.deliveryIsUncertain else {
+                throw GlucagonPumpError.pumpNotReady
+            }
+            try await manager.enactBolus(decisionId: nil, units: units, activationType: .manualNoRecommendation)
+        }
+
+        var history = glucagonDeliveryHistory
+        history.append(GlucagonDeliveryRecord(units: units))
+        rawGlucagonDeliveryHistory = Array(history.suffix(200)).map(\.rawValue)
+        NotificationCenter.default.post(name: .GlucagonDeliveryHistoryChanged, object: self)
     }
     
     var pumpManagerStatus: PumpManagerStatus? {
@@ -1003,6 +1284,11 @@ extension DeviceDataManager: CGMManagerOnboardingDelegate {
 
 // MARK: - PumpManagerDelegate
 extension DeviceDataManager: PumpManagerDelegate {
+    private func isGlucagonPump(_ manager: PumpManager) -> Bool {
+        guard let glucagonPumpManager else { return false }
+        return manager === glucagonPumpManager
+    }
+
     var automatedTreatmentState: LoopKit.AutomatedTreatmentState? {
         return loopControl.automatedTreatmentState
     }
@@ -1013,23 +1299,34 @@ extension DeviceDataManager: PumpManagerDelegate {
         dispatchPrecondition(condition: .onQueue(.main))
         log.default("PumpManager:%{public}@ did adjust pump clock by %fs", String(describing: type(of: pumpManager)), adjustment)
 
-        analyticsServicesManager.pumpTimeDidDrift(adjustment)
+        if !isGlucagonPump(pumpManager) {
+            analyticsServicesManager.pumpTimeDidDrift(adjustment)
+        }
     }
 
     func pumpManagerDidUpdateState(_ pumpManager: PumpManager) {
         dispatchPrecondition(condition: .onQueue(.main))
         log.default("PumpManager:%{public}@ did update state", String(describing: type(of: pumpManager)))
 
-        rawPumpManager = pumpManager.rawValue
+        if isGlucagonPump(pumpManager) {
+            rawGlucagonPumpManager = pumpManager.rawValue
+        } else {
+            rawPumpManager = pumpManager.rawValue
+        }
     }
     
     func pumpManager(_ pumpManager: PumpManager, didRequestBasalRateScheduleChange basalRateSchedule: BasalRateSchedule, completion: @escaping (Error?) -> Void) {
+        guard !isGlucagonPump(pumpManager) else {
+            completion(GlucagonPumpError.basalDeliveryForbidden)
+            return
+        }
         saveUpdatedBasalRateSchedule(basalRateSchedule)
         completion(nil)
     }
 
     func pumpManagerBLEHeartbeatDidFire(_ pumpManager: PumpManager) {
         Task { @MainActor in
+            guard !isGlucagonPump(pumpManager) else { return }
             log.default("PumpManager:%{public}@ did fire heartbeat", String(describing: type(of: pumpManager)))
             await refreshCGM()
         }
@@ -1037,6 +1334,7 @@ extension DeviceDataManager: PumpManagerDelegate {
 
     func pumpManagerMustProvideBLEHeartbeat(_ pumpManager: PumpManager) -> Bool {
         dispatchPrecondition(condition: .onQueue(.main))
+        if isGlucagonPump(pumpManager) { return false }
         return pumpManagerMustProvideBLEHeartbeat
     }
 
@@ -1051,6 +1349,11 @@ extension DeviceDataManager: PumpManagerDelegate {
     nonisolated func pumpManager(_ pumpManager: PumpManager, didUpdate status: PumpManagerStatus, oldStatus: PumpManagerStatus) {
         Task { @MainActor in
             log.default("PumpManager:%{public}@ did update status: %{public}@", String(describing: type(of: pumpManager)), String(describing: status))
+
+            if isGlucagonPump(pumpManager) {
+                NotificationCenter.default.post(name: .GlucagonPumpStatusChanged, object: self)
+                return
+            }
 
             doseStore.device = status.device
 
@@ -1090,14 +1393,19 @@ extension DeviceDataManager: PumpManagerDelegate {
         Task { @MainActor in
             log.default("Pump manager with identifier '%{public}@' will deactivate", pumpManager.pluginIdentifier)
 
-            self.pumpManager = nil
-            deliveryUncertaintyAlertManager = nil
+            if isGlucagonPump(pumpManager) {
+                self.glucagonPumpManager = nil
+            } else {
+                self.pumpManager = nil
+                deliveryUncertaintyAlertManager = nil
+            }
             settingsManager.storeSettings()
         }
     }
 
     nonisolated func pumpManager(_ pumpManager: PumpManager, didUpdatePumpRecordsBasalProfileStartEvents pumpRecordsBasalProfileStartEvents: Bool) {
         Task { @MainActor in
+            guard !isGlucagonPump(pumpManager) else { return }
             log.default("PumpManager:%{public}@ did update pumpRecordsBasalProfileStartEvents to %{public}@", String(describing: type(of: pumpManager)), String(describing: pumpRecordsBasalProfileStartEvents))
             doseStore.pumpRecordsBasalProfileStartEvents = pumpRecordsBasalProfileStartEvents
         }
@@ -1121,6 +1429,13 @@ extension DeviceDataManager: PumpManagerDelegate {
     {
         Task { @MainActor in
             log.default("PumpManager:%{public}@ hasNewPumpEvents (lastReconciliation = %{public}@)", String(describing: type(of: pumpManager)), String(describing: lastReconciliation))
+            if isGlucagonPump(pumpManager) {
+                var history = rawGlucagonPumpEventHistory ?? []
+                history.append(contentsOf: events.map(\.rawValue))
+                rawGlucagonPumpEventHistory = Array(history.suffix(500))
+                completion(nil)
+                return
+            }
             do {
                 try await doseStore.addPumpEvents(events, lastReconciliation: lastReconciliation, replacePendingEvents: replacePendingEvents)
             } catch {
@@ -1143,6 +1458,20 @@ extension DeviceDataManager: PumpManagerDelegate {
             dispatchPrecondition(condition: .onQueue(.main))
             log.default("PumpManager:%{public}@ did read reservoir value", String(describing: type(of: pumpManager)))
 
+            if isGlucagonPump(pumpManager) {
+                let previousRaw = rawGlucagonReservoirHistory?.last
+                let previous = previousRaw.flatMap { raw -> GlucagonReservoirValue? in
+                    guard let date = raw["date"] as? Date, let units = raw["units"] as? Double else { return nil }
+                    return GlucagonReservoirValue(startDate: date, unitVolume: units)
+                }
+                var history = rawGlucagonReservoirHistory ?? []
+                history.append(["date": date, "units": units])
+                rawGlucagonReservoirHistory = Array(history.suffix(500))
+                let value = GlucagonReservoirValue(startDate: date, unitVolume: units)
+                completion(.success((newValue: value, lastValue: previous, areStoredValuesContinuous: previous != nil)))
+                return
+            }
+
             do {
                 let (newValue, lastValue, areStoredValuesContinuous) = try await doseStore.addReservoirValue(units, at: date)
                 completion(.success((newValue: newValue, lastValue: lastValue, areStoredValuesContinuous: areStoredValuesContinuous)))
@@ -1154,6 +1483,9 @@ extension DeviceDataManager: PumpManagerDelegate {
     }
 
     func startDateToFilterNewPumpEvents(for manager: PumpManager) -> Date {
+        if isGlucagonPump(manager) {
+            return (rawGlucagonPumpEventHistory ?? []).compactMap { $0["date"] as? Date }.max() ?? .distantPast
+        }
         return doseStore.pumpEventQueryAfterDate
     }
 
@@ -1310,6 +1642,9 @@ extension DeviceDataManager: BolusDurationEstimator {
 
 extension Notification.Name {
     static let PumpManagerChanged = Notification.Name(rawValue:  "com.loopKit.notification.PumpManagerChanged")
+    static let GlucagonPumpManagerChanged = Notification.Name(rawValue: "com.loopKit.notification.GlucagonPumpManagerChanged")
+    static let GlucagonPumpStatusChanged = Notification.Name(rawValue: "com.loopKit.notification.GlucagonPumpStatusChanged")
+    static let GlucagonDeliveryHistoryChanged = Notification.Name(rawValue: "com.loopKit.notification.GlucagonDeliveryHistoryChanged")
     static let CGMManagerChanged = Notification.Name(rawValue:  "com.loopKit.notification.CGMManagerChanged")
     static let PumpEventsAdded = Notification.Name(rawValue:  "com.loopKit.notification.PumpEventsAdded")
 }
@@ -1397,7 +1732,7 @@ extension DeviceDataManager: TherapySettingsViewModelDelegate {
 }
 
 extension DeviceDataManager: DeviceSupportDelegate {
-    var availableSupports: [SupportUI] { [cgmManager, pumpManager].compactMap { $0 as? SupportUI } }
+    var availableSupports: [SupportUI] { [cgmManager, pumpManager, glucagonPumpManager].compactMap { $0 as? SupportUI } }
 
     func generateDiagnosticReport() async -> String {
         let report = [
@@ -1411,6 +1746,8 @@ extension DeviceDataManager: DeviceSupportDelegate {
             self.cgmManager != nil ? String(reflecting: self.cgmManager!) : "cgmManager: nil",
             "",
             self.pumpManager != nil ? String(reflecting: self.pumpManager!) : "pumpManager: nil",
+            "",
+            self.glucagonPumpManager != nil ? String(reflecting: self.glucagonPumpManager!) : "glucagonPumpManager: nil",
             "",
             await deviceLog.generateDiagnosticReport()
             ]
@@ -1472,7 +1809,9 @@ extension DeviceDataManager: DeliveryDelegate {
 
         log.default("Enacting dose: %{public}@", String(describing: (bolus, tempBasal)))
         
-        try await doseEnactor.enact(decisionId: decisionId, bolus: bolus, tempBasal: tempBasal, with: pumpManager)
+        try await pumpCommandArbitrator.perform {
+            try await doseEnactor.enact(decisionId: decisionId, bolus: bolus, tempBasal: tempBasal, with: pumpManager)
+        }
     }
 
     var basalDeliveryState: PumpManagerStatus.BasalDeliveryState? {
